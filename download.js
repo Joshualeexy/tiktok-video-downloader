@@ -6,13 +6,15 @@ const sanitize = require('sanitize-filename');
 const { chromium } = require('playwright');
 const { exec } = require('child_process');
 const { promisify } = require('util');
+const archiver = require('archiver');
 
 const execPromise = promisify(exec);
 
 // ==================== CONFIGURATION ====================
 const ApiUrl = "https://www.tikwm.com/api/";
 const failLogPath = path.join(__dirname, 'download-failures.log');
-const downloadsRoot = path.join(os.homedir(), 'Downloads');
+const permanentDownloadsRoot = path.join(os.homedir(), 'Downloads');
+let downloadsRoot = permanentDownloadsRoot; // This will be changed to temp dir when using --zip
 const MAX_RETRIES = 2;
 const RETRY_DELAY = 1000;
 const USE_AUTHENTICATION = false; // Set to true to enable cookie-based auth
@@ -21,6 +23,7 @@ const USE_AUTHENTICATION = false; // Set to true to enable cookie-based auth
 
 async function scrapeTikTokProfile(username, targetCount) {
   console.log(`\n🔍 Starting scraper for @${username}...`);
+  console.log(`🎯 Target: ${targetCount} posts`);
   
   const storagePath = path.resolve(__dirname, 'cookies.json');
   const browser = await chromium.launch({ headless: false });
@@ -36,11 +39,11 @@ async function scrapeTikTokProfile(username, targetCount) {
     const rawCookies = Array.isArray(raw) ? raw : raw.cookies;
     
     if (Array.isArray(rawCookies)) {
-      const cookies = rawCookies.map(({ name, value, domain, path, secure, httpOnly, expirationDate, expires }) => ({
+      const cookies = rawCookies.map(({ name, value, domain, path: cookiePath, secure, httpOnly, expirationDate, expires }) => ({
         name,
         value,
         domain,
-        path: path || '/',
+        path: cookiePath || '/',
         secure: !!secure,
         httpOnly: !!httpOnly,
         expires: expires || (expirationDate ? Math.floor(expirationDate) : -1)
@@ -76,13 +79,49 @@ async function scrapeTikTokProfile(username, targetCount) {
 
   await page.waitForSelector('a[href*="/video/"], a[href*="/photo/"]', { timeout: 0 });
 
-  let lastCount = 0;
+  let uniqueUrls = new Set();
   let stagnantScrolls = 0;
-  const MAX_STAGNANT_SCROLLS = 5; // Allow 5 scrolls with no new content before giving up
+  const MAX_STAGNANT_SCROLLS = 5;
   
   console.log('🔄 Scrolling page to load more videos and photos...');
 
   for (let i = 0; i < 100; i++) {
+    // Get current links on page
+    const currentLinks = await page.$$eval('a[href*="/video/"], a[href*="/photo/"]', links =>
+      Array.from(new Set(links.map(link => link.href)))
+    );
+    
+    // Track how many NEW links we found
+    const previousSize = uniqueUrls.size;
+    currentLinks.forEach(link => uniqueUrls.add(link));
+    const currentSize = uniqueUrls.size;
+    const newFound = currentSize - previousSize;
+
+    console.log(`📊 Scroll ${i + 1}: Found ${newFound} new posts (Total: ${currentSize}/${targetCount})`);
+
+    // Check if we've reached the target
+    if (currentSize >= targetCount) {
+      console.log(`✅ Target reached! Found ${currentSize} posts`);
+      break;
+    }
+
+    // Check if NEW content is loading
+    if (newFound === 0) {
+      stagnantScrolls++;
+      console.log(`⏳ No new content (${stagnantScrolls}/${MAX_STAGNANT_SCROLLS} attempts)`);
+      
+      if (stagnantScrolls >= MAX_STAGNANT_SCROLLS) {
+        console.log(`⛔ No more posts loading — stopping at ${currentSize} posts`);
+        break;
+      }
+      
+      // Wait longer when stagnant (network might be slow)
+      await page.waitForTimeout(3000);
+    } else {
+      // Reset stagnant counter when new content loads
+      stagnantScrolls = 0;
+    }
+
     // Scroll to bottom
     await page.evaluate(() => {
       window.scrollTo(0, document.body.scrollHeight);
@@ -95,43 +134,17 @@ async function scrapeTikTokProfile(username, targetCount) {
       // If network doesn't idle in 5s, continue anyway
       await page.waitForTimeout(2000);
     }
-
-    const currentCount = await page.$eval('a[href*="/video/"], a[href*="/photo/"]', els => els.length);
-    // console.log(`🔍 Scroll ${i + 1}: ${currentCount} posts found (target: ${targetCount})`);
-
-    // Check if we've reached the target
-    if (currentCount >= targetCount) {
-      console.log('✅ Target reached!');
-      break;
-    }
-
-    // Check if content is loading
-    if (currentCount === lastCount) {
-      stagnantScrolls++;
-      console.log(`⏳ No new content (${stagnantScrolls}/${MAX_STAGNANT_SCROLLS} attempts)`);
-      
-      if (stagnantScrolls >= MAX_STAGNANT_SCROLLS) {
-        console.log('⛔ No more posts loading after multiple attempts — stopping scroll');
-        break;
-      }
-      
-      // Wait longer when stagnant (network might be slow)
-      await page.waitForTimeout(3000);
-    } else {
-      // Reset stagnant counter when new content loads
-      stagnantScrolls = 0;
-      lastCount = currentCount;
-    }
   }
-
-  const videoLinks = await page.$$eval('a[href*="/video/"], a[href*="/photo/"]', links =>
-    Array.from(new Set(links.map(link => link.href)))
-  );
 
   await browser.close();
 
-  console.log(`✅ Found ${videoLinks.length} video/photo URLs`);
-  return videoLinks.reverse();
+  const videoLinks = Array.from(uniqueUrls).reverse();
+  
+  // Limit to target count
+  const limitedLinks = videoLinks.slice(0, targetCount);
+  
+  console.log(`✅ Collected ${videoLinks.length} URLs, limiting to ${limitedLinks.length} as per target`);
+  return limitedLinks;
 }
 
 // ==================== DOWNLOADER FUNCTIONS ====================
@@ -221,8 +234,8 @@ async function createSlideshowVideo(imageFiles, audioFile, outputPath, audioDura
   fs.writeFileSync(concatFilePath, concatContent);
 
   const ffmpegCmd = audioFile 
-    ? `ffmpeg -f concat -safe 0 -i "${concatFilePath}" -i "${audioFile}" -c:v libx264 -tune stillimage -c:a aac -b:a 192k -pix_fmt yuv420p -shortest -y "${outputPath}"`
-    : `ffmpeg -f concat -safe 0 -i "${concatFilePath}" -c:v libx264 -tune stillimage -pix_fmt yuv420p -y "${outputPath}"`;
+    ? `ffmpeg -v error -f concat -safe 0 -i "${concatFilePath}" -i "${audioFile}" -c:v libx264 -tune stillimage -c:a aac -b:a 192k -pix_fmt yuv420p -shortest -y "${outputPath}"`
+    : `ffmpeg -v error -f concat -safe 0 -i "${concatFilePath}" -c:v libx264 -tune stillimage -pix_fmt yuv420p -y "${outputPath}"`;
 
   try {
     await execPromise(ffmpegCmd, { cwd: tempDir });
@@ -425,21 +438,88 @@ async function checkFFmpeg() {
   }
 }
 
-async function downloadAllContent(links) {
+async function zipAllDownloads(downloadStats, username, sourcePath, destinationPath) {
+  try {
+    console.log('\n📦 Creating zip file of all downloads...');
+
+    // Find all user folders in the source path
+    const userFolders = fs.readdirSync(sourcePath)
+      .map(file => path.join(sourcePath, file))
+      .filter(file => fs.statSync(file).isDirectory());
+
+    if (userFolders.length === 0) {
+      console.log('⚠️  No downloaded content to zip');
+      return;
+    }
+
+    // Create zip with username
+    const zipFileName = username ? `${username}.zip` : `tiktok_downloads_${Date.now()}.zip`;
+    const zipPath = path.join(destinationPath, zipFileName);
+
+    // Zip all user folders
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver('zip', { zlib: { level: 6 } });
+
+    await new Promise((resolve, reject) => {
+      output.on('close', () => {
+        const stats = fs.statSync(zipPath);
+        const sizeInMB = (stats.size / 1024 / 1024).toFixed(2);
+        console.log(`✅ Zip file created: ${zipFileName} (${sizeInMB} MB)`);
+        console.log(`📂 Location: ${zipPath}`);
+        downloadStats.zipSize = sizeInMB;
+        downloadStats.zipPath = zipPath;
+        resolve();
+      });
+
+      archive.on('error', (err) => {
+        reject(err);
+      });
+
+      archive.pipe(output);
+
+      // Add each user folder to the zip
+      userFolders.forEach(userFolder => {
+        const userName = path.basename(userFolder);
+        archive.directory(userFolder, userName);
+      });
+
+      archive.finalize();
+    });
+  } catch (err) {
+    console.error(`❌ Failed to create zip file: ${err.message}`);
+  }
+}
+
+async function downloadAllContent(links, shouldZip = false, username = null) {
   console.log('\n📥 Starting batch download...');
-  console.log(`📁 Download location: ${downloadsRoot}`);
   
   const hasFFmpeg = await checkFFmpeg();
   if (!hasFFmpeg) {
     process.exit(1);
   }
   
+  // Use temp directory if zipping, otherwise use Downloads
+  let tempDownloadDir = null;
+  
+  if (shouldZip) {
+    tempDownloadDir = path.join(os.tmpdir(), `tiktok_batch_${Date.now()}`);
+    downloadsRoot = tempDownloadDir;
+    console.log(`📁 Using temporary location (will create zip only)`);
+  } else {
+    downloadsRoot = permanentDownloadsRoot;
+    console.log(`📁 Download location: ${downloadsRoot}`);
+  }
+  
+  console.log(`📊 Will download: ${links.length} items`);
+  
   if (fs.existsSync(failLogPath)) fs.unlinkSync(failLogPath);
 
   let stats = {
     downloaded: 0,
     skipped: 0,
-    failed: 0
+    failed: 0,
+    zipSize: null,
+    zipPath: null
   };
 
   for (let i = 0; i < links.length; i++) {
@@ -454,8 +534,28 @@ async function downloadAllContent(links) {
     }
   }
 
+  if (shouldZip) {
+    await zipAllDownloads(stats, username, tempDownloadDir, permanentDownloadsRoot);
+    
+    // Clean up temporary directory after zipping
+    if (tempDownloadDir && fs.existsSync(tempDownloadDir)) {
+      console.log('🧹 Cleaning up temporary files...');
+      fs.rmSync(tempDownloadDir, { recursive: true, force: true });
+      console.log('✅ Temporary files removed - only zip file remains');
+    }
+    
+    // Restore original downloads root
+    downloadsRoot = permanentDownloadsRoot;
+  }
+
   console.log('\n🎉 Download complete!');
   console.log(`📊 Stats: ${stats.downloaded} downloaded, ${stats.skipped} skipped, ${stats.failed} failed`);
+  
+  if (stats.zipSize) {
+    console.log(`📦 Zip file: ${stats.zipSize} MB`);
+  } else {
+    console.log(`📂 Files saved to: ${permanentDownloadsRoot}`);
+  }
   
   if (stats.failed > 0) {
     console.log(`📝 Check ${failLogPath} for failed downloads`);
@@ -469,13 +569,18 @@ async function downloadAllContent(links) {
   
   if (args.length === 0) {
     console.log('📖 Usage:');
-    console.log('  node script.js <username> [count]     - Scrape profile and download');
-    console.log('  node script.js --download-only        - Download from existing videos.json');
+    console.log('  node download.js <username> [count] [--zip]     - Scrape profile and download');
+    console.log('  node download.js --download-only [--zip]        - Download from existing videos.json');
     console.log('\nExamples:');
-    console.log('  node script.js johndoe 150');
-    console.log('  node script.js --download-only');
+    console.log('  node download.js johndoe 150                    - Download 150 videos to folder');
+    console.log('  node download.js johndoe 150 --zip              - Download 150 videos, create zip, delete originals');
+    console.log('  node download.js --download-only                - Download from videos.json to folder');
+    console.log('  node download.js --download-only --zip          - Download from videos.json, create zip, delete originals');
+    console.log('\nNote: Using --zip flag will only keep the zip file, temporary downloads will be deleted');
     process.exit(0);
   }
+
+  const shouldZip = args.includes('--zip');
 
   if (args[0] === '--download-only') {
     // Download mode only
@@ -486,7 +591,7 @@ async function downloadAllContent(links) {
 
     const links = JSON.parse(fs.readFileSync('videos.json', 'utf-8'));
     console.log(`📦 Found ${links.length} video links in videos.json`);
-    await downloadAllContent(links);
+    await downloadAllContent(links, shouldZip);
   } else {
     // Scrape and download mode
     const username = args[0];
@@ -505,7 +610,7 @@ async function downloadAllContent(links) {
     fs.writeFileSync(outputFile, JSON.stringify(links, null, 2));
     console.log(`✅ Saved ${links.length} URLs to ${outputFile}`);
 
-    // Step 2: Download
-    await downloadAllContent(links);
+    // Step 2: Download with username for zip naming
+    await downloadAllContent(links, shouldZip, username);
   }
 })();

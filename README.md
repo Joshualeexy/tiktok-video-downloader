@@ -1,162 +1,231 @@
-# TikTok Scraper & Downloader with FFmpeg Slideshow Converter
+# TikTok Scraper & Downloader
 
-A Node.js automation tool that scrapes TikTok profiles and downloads videos + photo slideshows. Uses Playwright for scraping, tikwm.com API for downloads, and FFmpeg for converting slideshows to videos.
+Automated tool for scraping TikTok profiles and downloading Videos. Combines Playwright browser automation, the tikwm.com unofficial API for watermark-free downloads, and FFmpeg for converting photo slideshows into videos with synchronized audio.
 
-## ✨ Features
+## Features
 
-- 🎥 **HD Watermark-Free Videos** - Downloads via tikwm.com unofficial API
-- 📸 **Slideshow to Video** - Converts photo posts to MP4 with synced audio
-- 🔍 **Profile Scraping** - Automated browser scrolling with Playwright
-- 🔄 **Smart Retry Logic** - Automatic retries with duplicate detection
-- 📊 **Progress Tracking** - Real-time stats (downloaded/skipped/failed)
+- 🎥 **Watermark-Free HD Videos** - Clean downloads without TikTok branding
+- 📸 **Slideshow Conversion** - Transforms photo carousels into MP4 videos with audio sync
+- 🔍 **Smart Scraping** - Automated scrolling that detects when no more content loads
+- ⚡ **Batch Processing** - Downloads entire profiles with progress tracking
+- 🔄 **Auto Retry** - Handles network failures with exponential backoff
+- ⏭️ **Skip Duplicates** - Won't re-download existing content
+- 📦 **Zip Export** - Optional automatic compression of all downloads
 
-## 🔌 tikwm.com API
+## tikwm.com API
 
-This tool uses the **unofficial tikwm.com API** (not TikTok's official API) which provides:
-- Watermark-free video streams (HD quality)
-- Photo slideshow images + audio tracks
-- No authentication needed for public content
+This tool uses **tikwm.com**, an unofficial third-party API that provides direct access to TikTok media without watermarks. It's not affiliated with TikTok's official API.
 
-**API Call Example:**
-```javascript
-const response = await axios.get("https://www.tikwm.com/api/", {
-  params: { url: tiktokUrl, hd: 1 }
-});
-```
+**What tikwm.com provides:**
+- HD video streams (watermark-free)
+- Photo slideshow images with audio tracks  
+- Video metadata (titles, captions)
+- Works without authentication for public profiles
 
-## 📋 Requirements
+## Requirements
 
-**Install these first:**
-- Node.js v14+ (v16+ recommended)
-- FFmpeg 4.0+ (for slideshow conversion)
+- **Node.js** 14+ (v16+ recommended)
+- **FFmpeg** 4.0+ with libx264 and AAC codecs
+- **npm packages**: axios, playwright, sanitize-filename, archiver
+
+### Installation
 
 ```bash
-# Install Node packages
-npm install axios playwright sanitize-filename dotenv
+# Install Node.js dependencies
+npm install axios playwright sanitize-filename archiver
 
 # Install FFmpeg
-# Windows: choco install ffmpeg
-# macOS:   brew install ffmpeg
-# Linux:   sudo apt install ffmpeg
+choco install ffmpeg          # Windows
+brew install ffmpeg           # macOS
+sudo apt install ffmpeg       # Linux
 
-# Verify FFmpeg
+# Verify FFmpeg installation
 ffmpeg -version
 ```
 
-## 🚀 Usage
+## Usage
 
-**Mode 1: Scrape + Download**
+### Scrape + Download
 ```bash
-node tiktok-scraper-downloader-enhanced.js <username> [count]
-
-# Examples
-node tiktok-scraper-downloader-enhanced.js johndoe 50
-node tiktok-scraper-downloader-enhanced.js janedoe 200
+node download.js <username> [count] [--zip]
 ```
 
-**Mode 2: Download Only (from existing videos.json)**
+**Examples:**
 ```bash
-node tiktok-scraper-downloader-enhanced.js --download-only
+# Download 50 most recent posts
+node download.js username 50
+
+# Download 200 posts and create zip file
+node download.js username 200 --zip
+
+# Download with default count (50)
+node download.js username
 ```
 
-## 📂 Output
-
-Downloads organized by username:
-```
-~/Downloads/
-  ├── @johndoe/
-  │   ├── Video_Caption_12345678.mp4
-  │   └── Slideshow_Caption_87654321.mp4
-  └── @janedoe/
-      └── ...
+### Download Only Mode
+```bash
+node download.js --download-only [--zip]
 ```
 
-## 🎬 How Slideshow Conversion Works
+Processes an existing `videos.json` file without scraping.
 
-1. Detects `/photo/` URLs as slideshows
-2. Downloads all images + audio from tikwm.com API
-3. Uses FFprobe to get audio duration
-4. Calculates timing: `duration_per_image = audio_duration / image_count`
-5. Creates FFmpeg concat file with image timings
-6. Encodes to MP4 with H.264 video + AAC audio:
+**Examples:**
+```bash
+# Download from videos.json
+node download.js --download-only
+
+# Download and create zip
+node download.js --download-only --zip
+```
+
+## How It Works
+
+### Profile Scraping
+1. Opens profile in Chromium browser (Playwright)
+2. Scrolls page to load content dynamically
+3. Stops when target count reached or no new posts appear
+4. Extracts and deduplicates all `/video/` and `/photo/` URLs
+5. Saves to `videos.json` for persistence
+
+### Video Downloads
+1. Fetches metadata from tikwm.com API
+2. Streams HD video directly to disk
+3. Saves as `Caption_Text_12345678.mp4` (last 8 digits = video ID)
+
+### Slideshow Conversion
+Photo posts are converted to videos using this pipeline:
+
+1. **Download Assets** - All images + audio track from API
+2. **Analyze Audio** - FFprobe extracts duration (e.g., 15.3 seconds)
+3. **Calculate Timing** - `duration_per_image = audio_duration ÷ image_count`
+4. **Generate Manifest** - Creates FFmpeg concat file with timings
+5. **Encode Video** - Combines images + audio into MP4
+6. **Cleanup** - Removes temporary files
+
+**FFmpeg Command:**
 ```bash
 ffmpeg -f concat -i concat.txt -i audio.mp3 \
        -c:v libx264 -tune stillimage \
-       -c:a aac -b:a 192k -pix_fmt yuv420p \
-       -shortest -y output.mp4
-```
-7. Cleans up temp files
-
-## ⚙️ Configuration (Optional)
-
-Create `.env` file:
-```env
-API_URL=https://www.tikwm.com/api/
-DOWNLOADS_ROOT=/path/to/downloads
-USE_AUTHENTICATION=false
+       -c:a aac -b:a 192k \
+       -pix_fmt yuv420p -shortest \
+       -y output.mp4
 ```
 
-**In-code constants:**
+### Zip Creation
+When using `--zip` flag:
+- Creates compressed archive of all downloaded content
+- Named as `username.zip` or `tiktok_downloads_timestamp.zip`
+- Saved in Downloads folder alongside content
+- Uses compression level 6 (balance of speed/size)
+
+## Configuration
+
+Optional settings in script:
 ```javascript
-MAX_RETRIES = 2              // Retry attempts
-RETRY_DELAY = 1000           // Delay between retries (ms)
-MAX_STAGNANT_SCROLLS = 5     // Stop scrolling after X attempts with no new content
+const ApiUrl = "https://www.tikwm.com/api/";
+const downloadsRoot = path.join(os.homedir(), 'Downloads');
+const MAX_RETRIES = 2;              // Retry failed downloads
+const RETRY_DELAY = 1000;           // Wait 1s, then 2s, then 3s...
+const MAX_STAGNANT_SCROLLS = 5;     // Stop after 5 scrolls with no new content
+const USE_AUTHENTICATION = false;   // Set true for private profiles
 ```
 
-## 🐛 Common Issues
+## Output Structure
+
+```
+~/Downloads/
+  ├── @username/
+  │   ├── Funny_Video_12345678.mp4
+  │   ├── Beach_Sunset_87654321.mp4  (converted slideshow)
+  │   └── Dance_Challenge_11223344.mp4
+  └── username.zip  (if --zip flag used)
+```
+
+## Troubleshooting
 
 **FFmpeg not found**
-- Install FFmpeg and add to system PATH
-- Verify: `ffmpeg -version`
+- Ensure FFmpeg is installed and in your system PATH
+- Test: `ffmpeg -version`
 
-**API errors / Empty downloads**
-- tikwm.com may be rate-limited (wait 10-15 min)
-- Increase retries: `MAX_RETRIES = 5`
-- Check `download-failures.log`
+**API returns no data**
+- tikwm.com may be rate-limited or down
+- Wait 10-15 minutes and retry
+- Verify the profile/video is still public
 
-**Scraper stops early**
-- Profile may be private (enable auth: `USE_AUTHENTICATION=true`)
-- Increase: `MAX_STAGNANT_SCROLLS = 10`
+**Scraper stops too early**
+- Profile might be private → Set `USE_AUTHENTICATION = true`
+- Increase stagnation threshold in script: `MAX_STAGNANT_SCROLLS = 10`
 
 **Slideshow has no audio**
-- Normal - not all slideshows have audio
-- Creates silent 15-second video by default
+- This is normal - not all slideshows have music
+- Script creates a silent 15-second video by default
 
-## 📊 Example Output
+**Empty file downloads (0 bytes)**
+- Network issue during download
+- Will auto-retry up to MAX_RETRIES times
+- Check `download-failures.log` for details
+
+**Zip file creation fails**
+- Ensure you have write permissions in Downloads folder
+- Check available disk space
+- Verify archiver package is installed: `npm install archiver`
+
+## Authentication (Optional)
+
+For private profiles or to avoid rate limits:
+
+1. Set `USE_AUTHENTICATION = true` in script
+2. Browser opens on first run for manual login
+3. Session saved to `cookies.json`
+4. Future runs use saved cookies automatically
+
+## Example Output
 
 ```
-🔍 Starting scraper for @johndoe...
+🔍 Starting scraper for @username...
+🔄 Scrolling page to load more videos and photos...
 ✅ Found 127 video/photo URLs
 ✅ Saved 127 URLs to videos.json
 
 📥 Starting batch download...
+📁 Download location: /Users/you/Downloads
+
 📸 [1/127] Downloading 8 images from slideshow...
 🎵 Downloaded audio (15.3s)
 🎬 Creating slideshow video...
-✅ [1/127] Created slideshow video: Beautiful_Sunset_87654321.mp4 (12.45 MB)
-✅ [2/127] Downloaded: Funny_Dance_12345678.mp4 (8.23 MB)
+✅ [1/127] Created slideshow video: Beach_Sunset_87654321.mp4 (12.45 MB)
+
+✅ [2/127] Downloaded: Dance_Video_12345678.mp4 (8.23 MB)
 ⏭️  [3/127] Already exists: 11223344
+
+📦 Creating zip file of all downloads...
+✅ Zip file created: username.zip (245.67 MB)
 
 🎉 Download complete!
 📊 Stats: 125 downloaded, 2 skipped, 0 failed
+📦 Zip file: 245.67 MB
 ```
 
-## 🎯 Key Functions
+## Key Functions
 
-- `scrapeTikTokProfile()` - Playwright scraping with smart scrolling
-- `downloadTikTokVideo()` - HD video downloads via tikwm.com
-- `downloadTikTokPhotos()` - Slideshow download + FFmpeg conversion
-- `createSlideshowVideo()` - FFmpeg encoding pipeline
-- `isAlreadyDownloaded()` - Duplicate detection (last 8 digits of video ID)
+| Function | Purpose |
+|----------|---------|
+| `scrapeTikTokProfile()` | Playwright automation with intelligent scrolling |
+| `downloadTikTokVideo()` | Streams HD video from tikwm.com |
+| `downloadTikTokPhotos()` | Downloads slideshow images + audio |
+| `createSlideshowVideo()` | FFmpeg encoding pipeline |
+| `createZipFile()` | Compresses downloads into archive |
+| `isAlreadyDownloaded()` | Checks if file exists by video ID |
 
-## 📝 Notes
+## Technical Notes
 
-- Sequential downloads (no parallelism) to avoid API throttling
-- Temporary files stored in OS temp directory
-- Failures logged to `download-failures.log`
-- Filenames sanitized and limited to 200 characters
-- Last 8 digits of video ID used for duplicate detection
+- Downloads process sequentially to avoid API throttling
+- Temporary slideshow files stored in OS temp directory (`/tmp/tiktok_*`)
+- Failed downloads logged to `download-failures.log` with timestamps
+- Filenames limited to 200 characters (auto-truncated)
+- Duplicate detection uses last 8 digits of video ID in filename
+- Zip compression uses level 6 (balanced speed/size ratio)
 
 ---
 
-**For educational/archival purposes. Respect content creators' rights.**
+**For educational and personal archival use. Respect content creators' rights.**
